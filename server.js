@@ -1,6 +1,7 @@
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const fetch = require('node-fetch');const { JWT } = require('google-auth-library');
+const fetch = require('node-fetch');
+const { JWT } = require('google-auth-library');
 
 const app = express();
 
@@ -23,24 +24,41 @@ app.use((req, res, next) => {
 });
 
 // ---- FIREBASE HELPERS ----
-// Sign in as admin using Firebase REST API with a service email/password
+// Mint a Google OAuth token from a service account. Service accounts bypass
+// Firestore security rules; ordinary signed-in users do not.
+
+let _svcClient = null;
+let _cachedToken = null;
+let _cachedTokenExpiry = 0;
+
+function getServiceAccount() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT is not set');
+  const json = JSON.parse(raw);
+  if (json.private_key) json.private_key = json.private_key.replace(/\\n/g, '\n');
+  return json;
+}
 
 async function getFirebaseAdminToken() {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: process.env.FIREBASE_ADMIN_EMAIL,
-        password: process.env.FIREBASE_ADMIN_PASSWORD,
-        returnSecureToken: true,
-      }),
-    }
-  );
-  const data = await res.json();
-  if (data.error) throw new Error('Firebase admin auth failed: ' + data.error.message);
-  return data.idToken;
+  const now = Date.now();
+  if (_cachedToken && now < _cachedTokenExpiry - 60000) return _cachedToken;
+
+  if (!_svcClient) {
+    const sa = getServiceAccount();
+    _svcClient = new JWT({
+      email: sa.client_email,
+      key: sa.private_key,
+      scopes: ['https://www.googleapis.com/auth/datastore'],
+    });
+  }
+
+  const res = await _svcClient.getAccessToken();
+  const token = typeof res === 'string' ? res : res && res.token;
+  if (!token) throw new Error('Failed to mint Firestore access token');
+
+  _cachedToken = token;
+  _cachedTokenExpiry = (_svcClient.credentials && _svcClient.credentials.expiry_date) || now + 3300000;
+  return token;
 }
 
 async function upgradeUserToPro(email, plan) {
@@ -72,6 +90,10 @@ async function upgradeUserToPro(email, plan) {
     }),
   });
 
+  if (!queryRes.ok) {
+    const body = await queryRes.text();
+    throw new Error(`Firestore query failed (${queryRes.status}): ${body.slice(0, 300)}`);
+  }
   const queryData = await queryRes.json();
   const doc = queryData[0]?.document;
 
@@ -140,6 +162,10 @@ async function grantCredits(email, amount, label) {
       },
     }),
   });
+  if (!queryRes.ok) {
+    const body = await queryRes.text();
+    throw new Error(`Firestore query failed (${queryRes.status}): ${body.slice(0, 300)}`);
+  }
   const queryData = await queryRes.json();
   const doc = queryData[0]?.document;
   if (!doc) {
@@ -148,7 +174,7 @@ async function grantCredits(email, amount, label) {
   }
   const existing = parseInt(doc.fields?.credits?.integerValue || '0', 10) || 0;
   const next = existing + amount;
-  await fetch(`${doc.name}?updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`, {
+  const patchRes = await fetch(`${doc.name}?updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -158,6 +184,10 @@ async function grantCredits(email, amount, label) {
       },
     }),
   });
+  if (!patchRes.ok) {
+    const body = await patchRes.text();
+    throw new Error(`Credit update failed (${patchRes.status}): ${body.slice(0, 300)}`);
+  }
   console.log(`${label}: +${amount} credits for ${email}, now ${next}`);
 }
 
@@ -180,6 +210,10 @@ async function downgradeUserToFree(email) {
       },
     }),
   });
+  if (!queryRes.ok) {
+    const body = await queryRes.text();
+    throw new Error(`Firestore query failed (${queryRes.status}): ${body.slice(0, 300)}`);
+  }
   const queryData = await queryRes.json();
   const doc = queryData[0]?.document;
   if (!doc) return;
