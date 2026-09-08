@@ -61,9 +61,10 @@ async function getFirebaseAdminToken() {
   return token;
 }
 
-async function upgradeUserToPro(email, plan) {
+async function upgradeUserToPro(email, plan, interval) {
   const token = await getFirebaseAdminToken();
   const targetPlan = plan || 'pro';
+  const billing = interval === 'year' ? 'year' : 'month';
 
   // Credits granted per plan. Must match the extension's PLANS object.
   const PLAN_CREDITS = { free: 150, lite: 600, pro: 1600, power: 4000 };
@@ -122,9 +123,26 @@ async function upgradeUserToPro(email, plan) {
   const existing = parseInt(doc.fields?.credits?.integerValue || '0', 10) || 0;
   const newBalance = existing + credits;
 
+  // A yearly subscription only bills once, so Stripe fires nothing in months
+  // 2-12. We grant month 1 here and leave a schedule the drip picks up.
+  const dripFields = billing === 'year'
+    ? {
+        creditsNextGrantAt: { stringValue: addMonths(new Date(), 1).toISOString() },
+        creditsGrantsLeft: { integerValue: '11' },
+      }
+    : {
+        creditsNextGrantAt: { nullValue: null },
+        creditsGrantsLeft: { integerValue: '0' },
+      };
+
   const docPath = `https://firestore.googleapis.com/v1/${doc.name}`;
+  const masks = [
+    'plan', 'credits', 'updatedAt', 'planInterval',
+    'creditsPerMonth', 'creditsNextGrantAt', 'creditsGrantsLeft',
+  ].map(f => `updateMask.fieldPaths=${f}`).join('&');
+
   const updateRes = await fetch(
-    `${docPath}?updateMask.fieldPaths=plan&updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`,
+    `${docPath}?${masks}`,
     {
       method: 'PATCH',
       headers: {
@@ -136,13 +154,16 @@ async function upgradeUserToPro(email, plan) {
           plan: { stringValue: targetPlan },
           credits: { integerValue: String(newBalance) },
           updatedAt: { stringValue: new Date().toISOString() },
+          planInterval: { stringValue: billing },
+          creditsPerMonth: { integerValue: String(credits) },
+          ...dripFields,
         },
       }),
     }
   );
 
   if (updateRes.ok) {
-    console.log(`Upgraded ${email} to ${targetPlan} (+${credits} credits, now ${newBalance})`);
+    console.log(`Upgraded ${email} to ${targetPlan} ${billing}ly (+${credits} credits, now ${newBalance})`);
   } else {
     const err = await updateRes.json();
     console.error('Failed to upgrade user:', err);
@@ -227,6 +248,62 @@ async function downgradeUserToFree(email) {
   console.log(`Downgraded ${email} to Free`);
 }
 
+function addMonths(date, n) {
+  const d = new Date(date.getTime());
+  const day = d.getDate();
+  d.setMonth(d.getMonth() + n);
+  // Clamp Jan 31 + 1 month to Feb 28/29 rather than letting it roll to March.
+  if (d.getDate() < day) d.setDate(0);
+  return d;
+}
+
+// Yearly plans bill once but earn credits monthly. Rather than run a cron, we
+// top up lazily whenever the backend is touched and a month has come due.
+async function applyMonthlyDrip(uid, token) {
+  const url = `${FIRESTORE_URL}/users/${uid}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) return null;
+  const doc = await res.json();
+  const f = doc.fields || {};
+
+  const nextAt = f.creditsNextGrantAt?.stringValue;
+  let left = parseInt(f.creditsGrantsLeft?.integerValue || '0', 10) || 0;
+  const perMonth = parseInt(f.creditsPerMonth?.integerValue || '0', 10) || 0;
+  if (!nextAt || left <= 0 || perMonth <= 0) return doc;
+
+  let credits = parseInt(f.credits?.integerValue || '0', 10) || 0;
+  let due = new Date(nextAt);
+  const now = new Date();
+  let granted = 0;
+
+  while (due <= now && left > 0) {
+    credits += perMonth;
+    left -= 1;
+    granted += perMonth;
+    due = addMonths(due, 1);
+  }
+  if (!granted) return doc;
+
+  const masks = ['credits', 'creditsNextGrantAt', 'creditsGrantsLeft', 'updatedAt']
+    .map(x => `updateMask.fieldPaths=${x}`).join('&');
+  await fetch(`${url}?${masks}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      fields: {
+        credits: { integerValue: String(credits) },
+        creditsNextGrantAt: { stringValue: due.toISOString() },
+        creditsGrantsLeft: { integerValue: String(left) },
+        updatedAt: { stringValue: new Date().toISOString() },
+      },
+    }),
+  });
+  console.log(`Monthly drip: +${granted} credits for ${uid}, now ${credits} (${left} grants left)`);
+
+  doc.fields.credits = { integerValue: String(credits) };
+  return doc;
+}
+
 function encodeEmail(email) {
   return email.replace(/[@.]/g, '_');
 }
@@ -264,7 +341,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         // A top-up adds credits without changing the plan.
         await grantCredits(email, explicitCredits, 'Credit top-up');
       } else if (email) {
-        await upgradeUserToPro(email, meta.plan || 'pro');
+        await upgradeUserToPro(email, meta.plan || 'pro', meta.interval);
       }
     } else if (event.type === 'customer.subscription.deleted') {
       const customer = await stripe.customers.retrieve(event.data.object.customer);
@@ -358,10 +435,12 @@ app.post('/generate', async (req, res) => {
 // ---- CHECKOUT ----
 // Creates a Stripe Checkout Session on demand. No payment links, no products to
 // maintain: change a price here and it takes effect immediately.
+// Prices in cents. Yearly is 20% off the monthly rate, which lands on clean
+// per-month figures: $3.99, $7.99, $15.99.
 const PLAN_PRICES = {
-  lite:  { name: 'LinkedAI Lite',  amount: 499,  credits: 600 },
-  pro:   { name: 'LinkedAI Pro',   amount: 999,  credits: 1600 },
-  power: { name: 'LinkedAI Power', amount: 1999, credits: 4000 },
+  lite:  { name: 'LinkedAI Lite',  month: 499,  year: 4788,  credits: 600 },
+  pro:   { name: 'LinkedAI Pro',   month: 999,  year: 9588,  credits: 1600 },
+  power: { name: 'LinkedAI Power', month: 1999, year: 19188, credits: 4000 },
 };
 
 const TOPUP_PRICES = {
@@ -373,7 +452,8 @@ const TOPUP_PRICES = {
 
 app.post('/checkout', async (req, res) => {
   try {
-    const { kind, id, origin } = req.body || {};
+    const { kind, id, origin, interval } = req.body || {};
+    const billing = interval === 'year' ? 'year' : 'month';
     const site = origin || 'https://linkedai-ff45f.web.app';
 
     const idToken = (req.headers.authorization || '').replace('Bearer ', '').trim();
@@ -436,6 +516,9 @@ app.post('/checkout', async (req, res) => {
     const plan = PLAN_PRICES[id];
     if (!plan) return res.status(400).json({ error: 'Unknown plan.' });
 
+    const amount = billing === 'year' ? plan.year : plan.month;
+    const planMeta = { uid, plan: id, interval: billing, credits: String(plan.credits) };
+
     const session = await stripe.checkout.sessions.create({
       customer: customer.id,
       mode: 'subscription',
@@ -443,19 +526,21 @@ app.post('/checkout', async (req, res) => {
         price_data: {
           currency: 'usd',
           product_data: {
-            name: plan.name,
-            description: `${plan.credits.toLocaleString()} credits every month.`,
+            name: billing === 'year' ? `${plan.name} (yearly)` : plan.name,
+            description: billing === 'year'
+              ? `${plan.credits.toLocaleString()} credits every month, billed once a year.`
+              : `${plan.credits.toLocaleString()} credits every month.`,
           },
-          unit_amount: plan.amount,
-          recurring: { interval: 'month' },
+          unit_amount: amount,
+          recurring: { interval: billing },
         },
         quantity: 1,
       }],
       success_url: `${site}/pricing.html?upgrade=success`,
       cancel_url: `${site}/pricing.html?upgrade=cancelled`,
       client_reference_id: uid,
-      metadata: { uid, email, kind: 'subscription', plan: id, credits: String(plan.credits) },
-      subscription_data: { metadata: { uid, plan: id, credits: String(plan.credits) } },
+      metadata: { ...planMeta, email, kind: 'subscription' },
+      subscription_data: { metadata: planMeta },
     });
 
     res.json({ url: session.url });
@@ -489,15 +574,13 @@ app.get('/credits', async (req, res) => {
     if (!uid) return res.status(401).json({ error: 'Session expired' });
 
     const token = await getFirebaseAdminToken();
-    const docRes = await fetch(`${FIRESTORE_URL}/users/${uid}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!docRes.ok) return res.json({ balance: null });
-
-    const doc = await docRes.json();
+    // Grants any months a yearly subscriber has become due for.
+    const doc = await applyMonthlyDrip(uid, token);
+    if (!doc) return res.json({ balance: null });
     res.json({
       balance: parseInt(doc.fields?.credits?.integerValue || '0', 10) || 0,
       plan: doc.fields?.plan?.stringValue || 'free',
+      interval: doc.fields?.planInterval?.stringValue || 'month',
     });
   } catch (err) {
     console.error('credits error:', err);
