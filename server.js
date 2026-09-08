@@ -122,7 +122,7 @@ async function upgradeUserToPro(email, plan) {
   const existing = parseInt(doc.fields?.credits?.integerValue || '0', 10) || 0;
   const newBalance = existing + credits;
 
-  const docPath = doc.name;
+  const docPath = `https://firestore.googleapis.com/v1/${doc.name}`;
   const updateRes = await fetch(
     `${docPath}?updateMask.fieldPaths=plan&updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`,
     {
@@ -174,7 +174,7 @@ async function grantCredits(email, amount, label) {
   }
   const existing = parseInt(doc.fields?.credits?.integerValue || '0', 10) || 0;
   const next = existing + amount;
-  const patchRes = await fetch(`${doc.name}?updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`, {
+  const patchRes = await fetch(`https://firestore.googleapis.com/v1/${doc.name}?updateMask.fieldPaths=credits&updateMask.fieldPaths=updatedAt`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -219,7 +219,7 @@ async function downgradeUserToFree(email) {
   if (!doc) return;
 
   // Drop them to free but leave existing credits alone — they paid for those.
-  await fetch(`${doc.name}?updateMask.fieldPaths=plan`, {
+  await fetch(`https://firestore.googleapis.com/v1/${doc.name}?updateMask.fieldPaths=plan`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ fields: { plan: { stringValue: 'free' } } }),
