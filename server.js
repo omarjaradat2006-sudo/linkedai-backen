@@ -493,7 +493,7 @@ app.post('/checkout', async (req, res) => {
         mode: 'payment',
         line_items: [{
           price_data: {
-            currency: 'usd',
+            currency: 'cad',
             product_data: {
               name: `${total.toLocaleString()} LinkedAI credits`,
               description: pack.bonus
@@ -524,7 +524,7 @@ app.post('/checkout', async (req, res) => {
       mode: 'subscription',
       line_items: [{
         price_data: {
-          currency: 'usd',
+          currency: 'cad',
           product_data: {
             name: billing === 'year' ? `${plan.name} (yearly)` : plan.name,
             description: billing === 'year'
