@@ -354,6 +354,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   res.json({ received: true });
 });
 
+const registerGenerateV2 = require('./generateV2');
+registerGenerateV2(app);
+
 app.use(express.json({ limit: '1mb' }));
 
 // ---- AI GENERATION ----
