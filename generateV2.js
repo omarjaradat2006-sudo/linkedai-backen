@@ -209,14 +209,14 @@ Skills they listed: ${profile.skills || '(none listed)'}
 Certifications: ${profile.certifications || '(none)'}
 Languages: ${profile.languages || '(none)'}
 Achievements and other information: ${[profile.achievements, profile.extra].filter(Boolean).join(' | ') || '(none)'}
-Education (added to the resume automatically; do not write it): ${educationText(profile)}
+Education (copied onto the resume from the profile automatically): ${educationText(profile)}
 
 WORK HISTORY — refer to jobs by their number
 ${jobsBlock(profile)}
 
 WRITE
-1. "headline": the target job title, optionally followed by one or two of the candidate's real qualifications taken from their skills or certifications, separated by " · ". No numbers.
-2. "summary": 3 to 5 sentences, 60 to 100 words. Who they are professionally, what they have actually done that matters for this posting, and what they bring. Mention the target company at most once, and only if it reads naturally. Use the fuller end of this range when the work history is short.
+1. "headline": the job title ONLY, for example "Warehouse Specialist". Nothing else: no certifications, licences, skills, separators (" · ", "|", "•") or numbers. Certifications belong in the certifications section, never in the headline.
+2. "summary": 2 to 3 sentences, 55 words at most. Who they are professionally, what they have actually done that matters for this posting, and what they bring. Write it without the candidate's name and without "he", "she", "his" or "her": start from the role, for example "Warehouse professional with..." and never "${profile.name || 'Name'} is a warehouse professional... He holds...". Mention the target company at most once, and only if it reads naturally.
 3. "experience": one entry for EVERY job in the work history, ordered by relevance to the posting. Each entry: {"jobIndex": <number>, "title": "...", "company": "...", "bullets": [...]}.
    - The resume must fill a full page. Give the most relevant job 5 to 7 bullets and every other job 3 to 5.
    - Each bullet is one sentence of 14 to 26 words, starting with a strong verb.
@@ -225,12 +225,14 @@ WRITE
    - Use the posting's vocabulary where it truly describes the work.
    - Fix obvious capitalisation or spelling in job titles and company names, but never change what a title means.
 4. "skills": 10 to 14 short items: skills the candidate listed, plus skills that are part of the everyday work of a job they held. Phrase them in the posting's terms when equivalent. Most relevant first. Never add a licence, certification or named software they did not list, and never add a skill only because the posting asks for it.
-5. "highlights": 0 to 3 short lines taken ONLY from their achievements and other information (for example languages or awards). Use an empty list if there is nothing.
+5. "highlights": 0 to 3 short lines taken ONLY from their achievements and other information (for example languages or awards). Use an empty list if there is nothing. Do not repeat certifications here.
+6. "certifications": ONLY the certifications listed above under Certifications, as a list. Never invent one. Use an empty list if there are none.
+7. "education": NEVER invent education. Copy only what is listed above under Education${profile.education.length ? '' : ' — the candidate listed none, so return an empty array []'}. If the profile has no education, return "education": [].
 
 NUMBERS: use a number or percentage only if that exact figure appears in the candidate's own text above. Otherwise describe the result in words.
 
 Return ONLY this JSON object, with no markdown and no commentary:
-{"headline":"","summary":"","experience":[{"jobIndex":0,"title":"","company":"","bullets":[""]}],"skills":[""],"highlights":[""]}`;
+{"headline":"","summary":"","experience":[{"jobIndex":0,"title":"","company":"","bullets":[""]}],"skills":[""],"highlights":[""],"certifications":[],"education":[]}`;
   return { system, user };
 }
 
@@ -356,11 +358,27 @@ function clean(t) {
     .replace(/\s+([,.;:])/g, '$1')
     .trim();
 }
+// The headline is the job title only. Anything after a separator (usually
+// certifications such as "Forklift Certified · WHMIS") is dropped here; the
+// certifications section comes from the profile.
 function cleanHeadline(h, page, profile) {
   const parts = String(h || '').split(/\s*[|·•]\s*/).map((x) => x.trim()).filter(Boolean)
-    .filter((x) => !/\d|%/.test(x)).slice(0, 3);
-  if (parts.length) return parts.join(' · ');
+    .filter((x) => !/\d|%/.test(x));
+  if (parts.length) return parts[0];
   return page.jobTitle || (profile.jobs[0] && profile.jobs[0].title) || '';
+}
+// Summary: at most 3 sentences and 55 words. Trims whole sentences only; the
+// first sentence is always kept.
+function cleanSummary(s) {
+  const all = sentences(clean(s)).map((x) => x.trim()).filter(Boolean);
+  const out = [];
+  let words = 0;
+  for (const x of all) {
+    const n = x.split(/\s+/).length;
+    if (out.length && (out.length >= 3 || words + n > 55)) break;
+    out.push(x); words += n;
+  }
+  return out.join(' ');
 }
 function matchJob(entry, jobs) {
   const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -427,7 +445,7 @@ function finalizeResume(raw, profile, page) {
     location: profile.location,
     linkedin: profile.linkedin,
     headline: cleanHeadline(raw.headline, page, profile),
-    summary: clean(raw.summary),
+    summary: cleanSummary(raw.summary),
     experience,
     skills: dedupe((Array.isArray(raw.skills) ? raw.skills : []).map(clean).filter(Boolean)).slice(0, 14),
     education: profile.education,
@@ -711,6 +729,8 @@ function createHandler(deps = {}) {
       ? [page.jobTitle, page.jobCompany].filter(Boolean).join(' at ')
       : page.name || page.headline || '';
     const entry = { id: jobId, mode, context: context.slice(0, 120), results, at: iso(), template: body.template || null, pageName: page.name || '' };
+    // The extension sends the visual layout it rendered with; History reopens in it.
+    if (typeof body.layout === 'string' && /^[A-Za-z]{1,39}$/.test(body.layout)) entry.layout = body.layout;
 
     const committed = await commit(uid, idToken, jobId, cost, entry).catch((e) => { log.error('commit threw', e); return { ok: false }; });
     if (!committed.ok) {
@@ -744,4 +764,4 @@ module.exports.createHandler = createHandler;
 module.exports.normalizeProfile = normalizeProfile;
 module.exports.finalizeResume = finalizeResume;
 module.exports.sanitizePage = sanitizePage;
-module.exports._internal = { keepTrueName, numbersIn, profileNumbers, cleanHeadline, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
+module.exports._internal = { keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
