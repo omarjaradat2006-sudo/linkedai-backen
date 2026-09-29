@@ -28,6 +28,14 @@
 // versions keep working.
 
 const COSTS = { resume: 35, coverletter: 25, optimizer: 20, outreach: 10 };
+// Resume + cover letter together. The server sets this price; the client's
+// number is never trusted.
+const BUNDLE_DISCOUNT = 5;
+COSTS.bundle = COSTS.resume + COSTS.coverletter - BUNDLE_DISCOUNT; // 55
+const MODE_LABELS = {
+  resume: 'Tailored resume', coverletter: 'Cover letter', bundle: 'Resume + cover letter',
+  optimizer: 'Profile optimization', outreach: 'Outreach messages',
+};
 const FREE_CREDITS = 150;
 const HISTORY_KEEP = 40;
 const JOBS_KEEP = 25;
@@ -136,7 +144,7 @@ function normalizeProfile(p) {
 
 function readiness(mode, profile) {
   const missing = [];
-  if (mode === 'resume' || mode === 'coverletter') {
+  if (mode === 'resume' || mode === 'coverletter' || mode === 'bundle') {
     if (!profile.name) missing.push('your name');
     if (!profile.jobs.some((j) => j.title || j.company)) missing.push('at least one job or role');
   }
@@ -166,17 +174,53 @@ function sanitizePage(pd) {
 // ---------------------------------------------------------------------------
 // Writing rules shared by every prompt
 // ---------------------------------------------------------------------------
-const BANNED = [
-  'leverage', 'utilize', 'spearhead', 'orchestrate', 'synergy', 'robust', 'dynamic', 'seamless',
-  'cutting-edge', 'best-in-class', 'world-class', 'results-driven', 'detail-oriented',
-  'attention to detail', 'team player', 'hard worker', 'go-getter', 'self-starter', 'passionate',
-  'proven track record', 'fast-paced environment', 'hit the ground running', 'from day one',
-  'wear many hats', 'think outside the box', 'responsible for', 'tasked with', 'assisted with',
-  'helped to', 'delve', 'tapestry', 'testament to', 'landscape', 'navigate', 'unlock', 'elevate',
-  'I am excited to', 'I am writing to apply', 'I believe I would be a great fit',
-  'I would love the opportunity', 'align with your values', 'look no further',
+// One set of writing rules for every mode. Included in every system prompt and
+// enforced afterwards by humanizeCheck().
+const HUMAN_BANNED = [
+  'delve', 'leverage', 'utilize', 'spearhead', 'synergy', 'robust', 'seamless', 'dynamic',
+  'passionate', 'passion for', 'thrilled', 'excited to apply', 'I am writing to express',
+  'I am confident that', 'eager to contribute', 'align with', 'aligns perfectly',
+  'proven track record', 'results-driven', 'detail-oriented', 'team player', 'go-getter',
+  'fast-paced environment', "in today's", 'ever-evolving', 'landscape', 'tapestry', 'testament',
+  'navigate', 'embark', 'journey', 'elevate', 'foster', 'empower', 'unlock', 'game-changer',
+  'cutting-edge', 'furthermore', 'moreover', 'additionally', 'in conclusion',
+  'I believe I would be a great fit', 'look no further', 'hit the ground running',
+  'wear many hats', 'above and beyond', 'thank you for your time and consideration',
 ];
-const STYLE_RULES = `Write in plain, specific, human English. Vary sentence length. No em-dashes used as dramatic pauses. No "not only X but also Y". No stacked abstract nouns like "dedication, drive and passion". Never use these words or phrases: ${BANNED.join(', ')}.`;
+const HUMAN_WRITING_RULES = `HUMAN_WRITING_RULES
+
+SPECIFIC, NOT GENERIC
+- Every claim must come from the user's real profile or the job posting. Never invent employers, numbers, tools, awards or education.
+- Prefer one concrete detail (a number, a tool, a situation) over a general statement.
+- If the profile has no detail for something, leave it out instead of padding.
+
+SOUND LIKE A PERSON
+- Mix sentence lengths. Never three sentences in a row of similar length.
+- Plain everyday words a person in that job would actually say.
+- Cover letters, outreach, and LinkedIn "About" sections: first person with contractions (I'm, I've, I'd).
+- Resumes: bullets start with a strong past-tense verb (present tense for the current job), no "I". Never start two bullets in a row with the same verb.
+- Don't make every paragraph or bullet the same length.
+- Don't list exactly three things by habit.
+
+BANNED WORDS AND PHRASES:
+${HUMAN_BANNED.map((w) => (w === 'additionally' ? 'additionally (at the start of a sentence)' : w)).join(', ')}.
+Also avoid: responsible for, tasked with, assisted with, helped to, attention to detail, hard worker, self-starter, world-class, best-in-class, think outside the box.
+
+BANNED PATTERNS
+- No em dashes (—) or en dashes as punctuation. Use a comma, period, or "and".
+- No "not only X but also Y". No "It's not just X, it's Y".
+- No rhetorical questions in cover letters or outreach.
+- No closing sentence that just repeats what the paragraph said.
+- No exclamation marks in resumes or cover letters. At most one in outreach.
+- No emojis unless the mode is outreach AND the goal is casual.
+
+MODE-SPECIFIC
+- Resume headline: the job title ONLY. Certifications go in the certifications field, never in the headline.
+- Resume summary: 2 or 3 sentences, max 55 words, no name, no he/she/I.
+- Resume education: never invent it. If the profile has none, return an empty array.
+- Cover letter: 250 to 350 words, 3 or 4 paragraphs. First sentence specific to THIS job or company. Include one real detail from the job posting and one real result from the profile. End with a plain, confident line about next steps, not a thank-you paragraph.
+- Outreach: under 90 words unless the goal needs more. Reference one specific thing about the recipient or job.
+- LinkedIn optimization: headline under 220 characters. About section in first person, with short paragraphs.`;
 
 function jobsBlock(profile) {
   if (!profile.jobs.length) return '(none given)';
@@ -194,7 +238,9 @@ function educationText(profile) {
 // Prompts
 // ---------------------------------------------------------------------------
 function resumePrompt(profile, page) {
-  const system = `You are a senior resume writer. The resume you write will be sent to a real employer under the candidate's name, so every statement must be true to the candidate's own information. You tailor emphasis, order and wording to the target job. You never invent employers, job titles, dates, tools, equipment, software, certifications, degrees, numbers or responsibilities that the candidate did not give you. ${STYLE_RULES}`;
+  const system = `You are a senior resume writer. The resume you write will be sent to a real employer under the candidate's name, so every statement must be true to the candidate's own information. You tailor emphasis, order and wording to the target job. You never invent employers, job titles, dates, tools, equipment, software, certifications, degrees, numbers or responsibilities that the candidate did not give you.
+
+${HUMAN_WRITING_RULES}`;
   const user = `TARGET JOB
 Title: ${page.jobTitle || '(not shown)'}
 Company: ${page.jobCompany || '(not shown)'}
@@ -216,10 +262,10 @@ ${jobsBlock(profile)}
 
 WRITE
 1. "headline": the job title ONLY, for example "Warehouse Specialist". Nothing else: no certifications, licences, skills, separators (" · ", "|", "•") or numbers. Certifications belong in the certifications section, never in the headline.
-2. "summary": 2 to 3 sentences, 55 words at most. Who they are professionally, what they have actually done that matters for this posting, and what they bring. Write it without the candidate's name and without "he", "she", "his" or "her": start from the role, for example "Warehouse professional with..." and never "${profile.name || 'Name'} is a warehouse professional... He holds...". Mention the target company at most once, and only if it reads naturally.
+2. "summary": 2 to 3 sentences, 55 words at most. Who they are professionally, what they have actually done that matters for this posting, and what they bring. Write it without the candidate's name and without "he", "she", "his", "her" or "I": start from the role, for example "Warehouse professional with..." and never "${profile.name || 'Name'} is a warehouse professional... He holds...". Mention the target company at most once, and only if it reads naturally.
 3. "experience": one entry for EVERY job in the work history, ordered by relevance to the posting. Each entry: {"jobIndex": <number>, "title": "...", "company": "...", "bullets": [...]}.
    - The resume must fill a full page. Give the most relevant job 5 to 7 bullets and every other job 3 to 5.
-   - Each bullet is one sentence of 14 to 26 words, starting with a strong verb.
+   - Each bullet is one sentence of roughly 10 to 26 words; vary the lengths. Start with a strong past-tense verb (present tense for the current job), never "I", and never start two bullets in a row with the same verb.
    - Build the bullets from, in order: (a) every duty the candidate mentioned, each as its own bullet; (b) how that work is normally carried out in that exact role; (c) the standard everyday duties that anyone holding that exact job title at that kind of employer performs, described plainly and without exaggeration. When the candidate's own description is short, lean on (b) and (c) so the page is full.
    - NEVER add: numbers they did not give, supervisory or management duties, promotions, awards, named software or systems, licences or certifications, or equipment that needs a licence or certification (such as a forklift) unless it appears in their skills or certifications.
    - Use the posting's vocabulary where it truly describes the work.
@@ -243,7 +289,9 @@ const LETTER_STYLES = {
 };
 
 function letterPrompt(profile, page, style) {
-  const system = `You write cover letters that sound like a capable person wrote them for one specific job. Every claim must be true to the candidate's own information; never invent experience, employers, tools, credentials or numbers. ${STYLE_RULES}`;
+  const system = `You write cover letters that sound like a capable person wrote them for one specific job. Every claim must be true to the candidate's own information; never invent experience, employers, tools, credentials or numbers.
+
+${HUMAN_WRITING_RULES}`;
   const user = `JOB
 Title: ${page.jobTitle || '(not shown)'}
 Company: ${page.jobCompany || '(not shown)'}
@@ -263,11 +311,11 @@ ${jobsBlock(profile)}
 
 STYLE: ${LETTER_STYLES[style] || LETTER_STYLES.direct}
 
-WRITE three or four paragraphs, 230 to 320 words in total:
-- why this role, and the strongest real reason the candidate fits it;
-- two or three specific requirements from the posting, each matched to something concrete the candidate actually did;
-- a short close stating availability and a plain request for a conversation.
-The letter must fall apart if another company's name were swapped in. Use numbers only if they appear in the candidate's own text. Do not include a greeting line or a sign-off; they are added separately.
+WRITE three or four paragraphs, 250 to 350 words in total, in the first person with contractions (I'm, I've, I'd):
+- the first sentence is specific to THIS job or company, never a generic opener;
+- include one real detail from the posting above, matched to something concrete the candidate actually did, and one real result from the candidate's own work history;
+- end with one plain, confident line about next steps (for example when they can start or talk). No thank-you paragraph, no rhetorical questions, no exclamation marks.
+Vary paragraph lengths. The letter must fall apart if another company's name were swapped in. Use numbers only if they appear in the candidate's own text. Do not include a greeting line or a sign-off; they are added separately.
 
 Return ONLY this JSON object, no markdown:
 {"subject":"","paragraphs":["",""]}`;
@@ -281,7 +329,9 @@ function outreachPrompt(profile, page, goal, goalContext) {
     jobseeking: `The sender is looking for ${goalContext ? 'a "' + goalContext + '" role' : 'a role'} and wants a conversation, not a favour.`,
     networking: 'The sender wants to build a genuine professional connection. Find a real point of overlap.',
   };
-  const system = `You write LinkedIn messages that get replies because they are specific, short and human. ${STYLE_RULES}`;
+  const system = `You write LinkedIn messages that get replies because they are specific, short and human.
+
+${HUMAN_WRITING_RULES}`;
   const user = `RECIPIENT (from their LinkedIn page)
 Name: ${page.name || '(unknown)'}
 Headline: ${page.headline || ''}
@@ -300,8 +350,8 @@ GOAL: ${goals[goal] || goals.networking}
 WRITE
 - "summary": two sentences on who the recipient is and the best angle for reaching out.
 - "messages": three different messages. Each must reference at least one specific, real detail from the recipient's page. Never open with "I came across your profile" or "I hope this finds you well".
-  1. professional, under 110 words;
-  2. warm and conversational, under 110 words;
+  1. professional, under 90 words;
+  2. warm and conversational, under 90 words;
   3. direct, under 280 characters so it fits a LinkedIn connection note.
 
 Return ONLY this JSON object, no markdown:
@@ -310,7 +360,9 @@ Return ONLY this JSON object, no markdown:
 }
 
 function optimizerPrompt(page) {
-  const system = `You rewrite LinkedIn profiles so they are specific, searchable and credible. Keep every fact true to the profile text; never invent employers, titles, numbers or credentials. ${STYLE_RULES}`;
+  const system = `You rewrite LinkedIn profiles so they are specific, searchable and credible. Keep every fact true to the profile text; never invent employers, titles, numbers or credentials.
+
+${HUMAN_WRITING_RULES}`;
   const user = `CURRENT PROFILE
 Name: ${page.name || ''}
 Headline: ${page.headline || ''}
@@ -321,7 +373,7 @@ Skills: ${page.skills.join(', ') || '(none)'}
 
 WRITE
 - "headline": under 220 characters, specific and keyword-rich, no buzzwords.
-- "about": first person, 180 to 300 words, with a strong specific first line.
+- "about": first person with contractions (I'm, I've, I'd), 180 to 300 words, in short paragraphs separated by a blank line, with a strong specific first line.
 - "experienceBullets": three rewritten experience bullets that lead with outcomes. Use numbers only if they appear in the profile text above.
 
 Return ONLY this JSON object, no markdown:
@@ -352,8 +404,7 @@ function unsupported(text, allowed) {
   return false;
 }
 function clean(t) {
-  return String(t == null ? '' : t)
-    .replace(/\s*—\s*/g, ', ')
+  return fixDashes(String(t == null ? '' : t))
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:])/g, '$1')
     .trim();
@@ -418,6 +469,52 @@ function dedupe(list) {
   return list.filter((x) => { const k = x.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 function sentences(text) { return String(text || '').match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) || []; }
+
+// ---------------------------------------------------------------------------
+// humanizeCheck: deterministic clean-up plus detection of banned phrasing.
+// ---------------------------------------------------------------------------
+// A date-like token on both sides of a dash means a range ("2023 – 2025",
+// "Jan 2024 — Present"); those dashes stay. Any other em dash, or an en dash
+// with spaces around it, is punctuation and becomes a comma. Hyphens and
+// unspaced en dashes (2023–2025) are never touched.
+const DATE_END = /(\b\d{4}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?)\s*$/i;
+const DATE_START = /^\s*(\d{4}\b|(?:present|current|now|today)\b|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b)/i;
+function fixDashes(text) {
+  const s = String(text == null ? '' : text);
+  return s.replace(/[ \t]*—[ \t]*|[ \t]+–[ \t]+/g, (m, off) => {
+    const before = s.slice(Math.max(0, off - 12), off);
+    const after = s.slice(off + m.length, off + m.length + 12);
+    if (DATE_END.test(before) && DATE_START.test(after)) return ' – ';
+    return ', ';
+  }).replace(/,\s*,/g, ',').replace(/,\s*([.;:!?])/g, '$1').replace(/^\s*,\s*/, '');
+}
+
+function phraseRegex(w) {
+  if (w === 'additionally') return /(^|[.!?]\s+|\n\s*)additionally\b/i; // only at the start of a sentence
+  const body = w.split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "['’]")).join('\\s+');
+  // Single words also catch their plain inflections (leverage -> leveraged, leveraging).
+  const tail = /\s/.test(w) || /-/.test(w) ? '' : '(?:s|es|d|ed|ing)?';
+  return new RegExp(`(^|[^A-Za-z])${body}${tail}(?![A-Za-z])`, 'i');
+}
+const BANNED_RES = HUMAN_BANNED.map((w) => [w, phraseRegex(w)]);
+const BANNED_PATTERNS = [
+  ['not only ... but also', /\bnot only\b[^.!?]*\bbut also\b/i],
+  ["it's not just X, it's Y", /\bit['’]s not just\b/i],
+];
+function bannedIn(text) {
+  const t = String(text || '');
+  const hits = [];
+  for (const [w, re] of BANNED_RES) if (re.test(t)) hits.push(w);
+  for (const [w, re] of BANNED_PATTERNS) if (re.test(t)) hits.push(w);
+  return hits;
+}
+// Step 1 (dashes) always runs; the returned hits decide whether the single
+// rewrite pass runs.
+function humanizeCheck(text) {
+  const fixed = fixDashes(text);
+  return { text: fixed, hits: bannedIn(fixed) };
+}
+const HUMANIZE_STATS = { runs: 0, rewrites: 0, phrases: {} };
 
 // Deterministic assembly: contact details, dates, education, certifications and
 // languages always come from the profile, never from the model, so none of them
@@ -595,8 +692,60 @@ function createHandler(deps = {}) {
     }
   }
 
+  // HUMAN_WRITING_RULES enforcement for one generated document. Every text field
+  // goes through humanizeCheck() (dashes fixed); if any banned phrasing is found,
+  // ONE rewrite pass fixes only the sentences involved. Never a second pass.
+  async function humanize(items, mode, allowed) {
+    const noBang = mode === 'resume' || mode === 'coverletter';
+    const flagged = [];
+    for (const it of items) {
+      if (!it.text) continue;
+      let t = it.text;
+      if (noBang) t = t.replace(/!+/g, '.');
+      const { text, hits } = humanizeCheck(t);
+      if (text !== it.text) it.set(text);
+      it.text = text;
+      if (hits.length) flagged.push(Object.assign(it, { hits }));
+    }
+    HUMANIZE_STATS.runs += 1;
+    if (!flagged.length) return;
+    HUMANIZE_STATS.rewrites += 1;
+    const phrases = [...new Set(flagged.flatMap((f) => f.hits))];
+    for (const ph of phrases) HUMANIZE_STATS.phrases[ph] = (HUMANIZE_STATS.phrases[ph] || 0) + 1;
+    (log.log || console.log).call(log, `[humanize] ${mode}: rewrite pass triggered by ${JSON.stringify(phrases)} in ${flagged.length} field(s). ` +
+      `Triggered ${HUMANIZE_STATS.rewrites} of ${HUMANIZE_STATS.runs} documents since start. Totals: ${JSON.stringify(HUMANIZE_STATS.phrases)}`);
+    try {
+      const out = await claudeJson({
+        system: `You edit text so it reads like a person wrote it. You change as little as possible and never add facts.\n\n${HUMAN_WRITING_RULES}`,
+        user: `Rewrite only the sentences containing these phrases: ${JSON.stringify(phrases)}. Keep everything else word for word. Follow HUMAN_WRITING_RULES.\n` +
+          'Each item below is one separate piece of text. Keep line breaks as they are. Return ONLY a JSON object {"texts":[...]} with one rewritten text per item, in the same order.\n' +
+          JSON.stringify(flagged.map((f) => f.text)),
+      }, { maxTokens: 2400, temperature: 0.3 });
+      const texts = Array.isArray(out.texts) ? out.texts : [];
+      flagged.forEach((f, i) => {
+        let v = typeof texts[i] === 'string' ? texts[i].trim() : '';
+        if (!v || v.length < f.text.length * 0.4) return; // keep the original rather than lose content
+        if (noBang) v = v.replace(/!+/g, '.');
+        v = fixDashes(v);
+        if (allowed && unsupported(v, allowed) && !unsupported(f.text, allowed)) return; // no new numbers
+        f.set(v);
+      });
+    } catch (e) {
+      log.error('[humanize] rewrite pass failed, keeping the text as it was', e && (e.publicMessage || e.message));
+    }
+  }
+
   async function generate(mode, profile, page, body) {
     const settings = MODE_SETTINGS[mode];
+    if (mode === 'bundle') {
+      // Both documents in parallel with the existing prompts; if either fails the
+      // whole request fails and nothing is charged.
+      const [resume, letter] = await Promise.all([
+        generate('resume', profile, page, body),
+        generate('coverletter', profile, page, Object.assign({}, body, { template: body.letterTemplate })),
+      ]);
+      return { type: 'bundle', data: resume.data, letter: letter.data };
+    }
     if (mode === 'resume') {
       const raw = await claudeJson(resumePrompt(profile, page), settings);
       const res = finalizeResume(raw, profile, page);
@@ -608,6 +757,14 @@ function createHandler(deps = {}) {
       await repairNumbers(items, allowed);
       res.experience.forEach((e) => { e.bullets = e.bullets.filter(Boolean); });
       res.highlights = res.highlights.filter(Boolean);
+      const texts = [];
+      res.experience.forEach((e) => e.bullets.forEach((b, i) => texts.push({ text: b, set: (v) => { e.bullets[i] = v; } })));
+      texts.push({ text: res.summary, set: (v) => { res.summary = v; } });
+      res.highlights.forEach((h, i) => texts.push({ text: h, set: (v) => { res.highlights[i] = v; } }));
+      res.skills.forEach((k, i) => texts.push({ text: k, set: (v) => { res.skills[i] = v; } }));
+      await humanize(texts, 'resume', allowed);
+      res.skills = dedupe(res.skills.filter((k) => k && !bannedIn(k).length)); // a skill that is only a cliché is dropped
+      res.summary = cleanSummary(res.summary);
       return { type: 'resume', data: res };
     }
     if (mode === 'coverletter') {
@@ -618,23 +775,38 @@ function createHandler(deps = {}) {
       const paras = (Array.isArray(raw.paragraphs) ? raw.paragraphs : []).map(clean);
       const items = paras.map((p, i) => ({ text: p, set: (v) => { paras[i] = v || sentences(p).filter((s) => !unsupported(s, allowed)).join(' ').trim(); } }));
       await repairNumbers(items, allowed);
+      const texts = paras.map((p, i) => ({ text: p, set: (v) => { paras[i] = v; } }));
+      texts.push({ text: clean(raw.subject), set: (v) => { raw.subject = v; } });
+      await humanize(texts, 'coverletter', allowed);
       raw.paragraphs = paras.filter(Boolean);
       return { type: 'coverletter', data: finalizeLetter(raw, profile, page) };
     }
     if (mode === 'optimizer') {
       const raw = await claudeJson(optimizerPrompt(page), settings);
-      return { type: 'optimizer', data: {
+      const data = {
         headline: clean(raw.headline).slice(0, 220),
         about: String(raw.about || '').trim(),
         experienceBullets: (Array.isArray(raw.experienceBullets) ? raw.experienceBullets : []).map(clean).filter(Boolean).slice(0, 5),
-      } };
+      };
+      const texts = [
+        { text: data.headline, set: (v) => { data.headline = clean(v).slice(0, 220); } },
+        { text: data.about, set: (v) => { data.about = v; } },
+      ];
+      data.experienceBullets.forEach((b, i) => texts.push({ text: b, set: (v) => { data.experienceBullets[i] = v; } }));
+      await humanize(texts, 'optimizer', null);
+      return { type: 'optimizer', data };
     }
     const raw = await claudeJson(outreachPrompt(profile, page, body.goal, clean(body.goalContext).slice(0, 200)), settings);
-    return {
+    const out = {
       summary: clean(raw.summary),
       messages: (Array.isArray(raw.messages) ? raw.messages : []).map((m) => String(m || '').trim()).filter(Boolean).slice(0, 3),
     };
+    const texts = [{ text: out.summary, set: (v) => { out.summary = v; } }];
+    out.messages.forEach((m, i) => texts.push({ text: m, set: (v) => { out.messages[i] = v; } }));
+    await humanize(texts, 'outreach', null);
+    return out;
   }
+
 
   // Deduct the credits and save the result in ONE write, guarded by the
   // document's updateTime so a concurrent spend elsewhere cannot be lost.
@@ -702,7 +874,7 @@ function createHandler(deps = {}) {
     if (missing.length) return reply(422, { error: 'profile_incomplete', missing, message: `Add ${missing.join(' and ')} to your profile first. You were not charged.` });
 
     const page = sanitizePage(body.pageData);
-    if ((mode === 'resume' || mode === 'coverletter') && !page.jobTitle && !page.jobDescription) {
+    if ((mode === 'resume' || mode === 'coverletter' || mode === 'bundle') && !page.jobTitle && !page.jobDescription) {
       return reply(422, { error: 'no_job', message: 'Could not read the job posting. Open the job on LinkedIn and try again. You were not charged.' });
     }
     if ((mode === 'outreach' || mode === 'optimizer') && !page.name && !page.headline) {
@@ -719,18 +891,26 @@ function createHandler(deps = {}) {
     try {
       results = await generate(mode, profile, page, body);
     } catch (e) {
-      const msg = (e && e.publicMessage) || 'Something went wrong. Please try again. You were not charged.';
+      let msg = (e && e.publicMessage) || 'Something went wrong. Please try again. You were not charged.';
+      if (!/You were not charged\.$/.test(msg)) msg = msg.replace(/\s*$/, ' You were not charged.');
       if (!(e && e.publicMessage)) log.error('generate failed', e);
       await patch(uid, idToken, { jobs: { mapValue: { fields: { [jobId]: enc({ status: 'error', mode, at: iso(), error: msg }) } } } }, [`jobs.${seg(jobId)}`]).catch(() => null);
       return reply(502, { status: 'error', error: msg });
     }
 
-    const context = (mode === 'resume' || mode === 'coverletter')
+    const context = (mode === 'resume' || mode === 'coverletter' || mode === 'bundle')
       ? [page.jobTitle, page.jobCompany].filter(Boolean).join(' at ')
       : page.name || page.headline || '';
     const entry = { id: jobId, mode, context: context.slice(0, 120), results, at: iso(), template: body.template || null, pageName: page.name || '' };
     // The extension sends the visual layout it rendered with; History reopens in it.
-    if (typeof body.layout === 'string' && /^[A-Za-z]{1,39}$/.test(body.layout)) entry.layout = body.layout;
+    const shortName = (v) => typeof v === 'string' && /^[A-Za-z]{1,39}$/.test(v);
+    if (shortName(body.layout)) entry.layout = body.layout;
+    if (mode === 'bundle') {
+      // Resume style in layout/template; cover letter design and tone alongside.
+      entry.label = MODE_LABELS.bundle;
+      if (shortName(body.letterLayout)) entry.letterLayout = body.letterLayout;
+      entry.letterTemplate = LETTER_STYLES[body.letterTemplate] ? body.letterTemplate : 'direct';
+    }
 
     const committed = await commit(uid, idToken, jobId, cost, entry).catch((e) => { log.error('commit threw', e); return { ok: false }; });
     if (!committed.ok) {
@@ -761,7 +941,9 @@ function registerGenerateV2(app, deps = {}) {
 module.exports = registerGenerateV2;
 module.exports.registerGenerateV2 = registerGenerateV2;
 module.exports.createHandler = createHandler;
+module.exports.COSTS = COSTS;
+module.exports.MODE_LABELS = MODE_LABELS;
 module.exports.normalizeProfile = normalizeProfile;
 module.exports.finalizeResume = finalizeResume;
 module.exports.sanitizePage = sanitizePage;
-module.exports._internal = { keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
+module.exports._internal = { fixDashes, humanizeCheck, bannedIn, HUMAN_WRITING_RULES, keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
