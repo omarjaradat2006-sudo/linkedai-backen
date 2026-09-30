@@ -139,6 +139,7 @@ function normalizeProfile(p) {
     achievements: str(p.achievements),
     extra: str(p.extra),
     availability: str(p.availability),
+    about: String(p.about || p.summary || p.bio || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
   };
 }
 
@@ -168,7 +169,17 @@ function sanitizePage(pd) {
     education: list(pd.education, 250),
     skills: list(pd.skills, 80),
     certifications: list(pd.certifications, 200),
+    // Whole visible profile text, a fallback for when the structured fields
+    // could not be read.
+    pageText: s(pd.pageText, 6000).trim(),
   };
+}
+
+// When the About or Experience fields came back empty, give the AI the raw page
+// text (trimmed to 6000 characters) so it still has the person's details.
+function rawProfileBlock(page) {
+  if (!page.pageText || (page.experience.length && page.about)) return '';
+  return `\nRaw profile text (the whole page as copied; use it for any details missing above):\n"""\n${page.pageText}\n"""\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,41 +333,160 @@ Return ONLY this JSON object, no markdown:
   return { system, user };
 }
 
-function outreachPrompt(profile, page, goal, goalContext) {
-  const goals = {
-    sales: `The sender is selling ${goalContext ? '"' + goalContext + '"' : 'a product or service'}. Connect it to something specific in the recipient's work, without a hard pitch.`,
-    recruiting: 'The sender wants to recruit this person. Reference their specific experience and why it fits.',
-    jobseeking: `The sender is looking for ${goalContext ? 'a "' + goalContext + '" role' : 'a role'} and wants a conversation, not a favour.`,
-    networking: 'The sender wants to build a genuine professional connection. Find a real point of overlap.',
-  };
-  const system = `You write LinkedIn messages that get replies because they are specific, short and human.
+// ---------------------------------------------------------------------------
+// Outreach: find real common ground between ME (the user's saved profile) and
+// THEM (the LinkedIn page), verify it against both texts, then write messages
+// that open with it.
+// ---------------------------------------------------------------------------
+const GROUND_TYPES = ['direct', 'transferable', 'direction', 'values', 'none'];
+
+function meBlock(profile) {
+  const lines = [];
+  if (profile.name) lines.push(`Name: ${profile.name}`);
+  if (profile.headline) lines.push(`Headline: ${profile.headline}`);
+  if (profile.location) lines.push(`Location: ${profile.location}`);
+  if (profile.about) lines.push(`About: ${profile.about}`);
+  if (profile.jobs.length) {
+    lines.push('Work history:');
+    profile.jobs.forEach((j) => lines.push(`- ${[j.title, j.company].filter(Boolean).join(' at ')}${j.dates ? ' (' + j.dates + ')' : ''}${j.description ? ': ' + j.description.replace(/\s+/g, ' ').slice(0, 500) : ''}`));
+  }
+  if (profile.education.length) lines.push(`Education: ${educationText(profile)}`);
+  if (profile.skills) lines.push(`Skills: ${profile.skills}`);
+  if (profile.certifications) lines.push(`Certifications: ${profile.certifications}`);
+  if (profile.languages) lines.push(`Languages: ${profile.languages}`);
+  const other = [profile.achievements, profile.extra].filter(Boolean).join(' | ');
+  if (other) lines.push(`Other (achievements, interests, volunteering, goals): ${other}`);
+  return lines.join('\n');
+}
+// True when ME has something beyond a bare name that could overlap with anyone.
+function meHasDetail(profile) {
+  return !!(profile.jobs.length || profile.education.length || profile.skills || profile.certifications ||
+    profile.location || profile.about || profile.headline || profile.achievements || profile.extra || profile.languages);
+}
+function themBlock(page) {
+  const lines = [
+    `Name: ${page.name || '(unknown)'}`,
+    `Headline: ${page.headline || ''}`,
+    `Location: ${page.location || ''}`,
+    `About: ${page.about || ''}`,
+    `Experience: ${page.experience.join(' | ') || ''}`,
+    `Education: ${page.education.join(' | ') || ''}`,
+    `Skills: ${page.skills.join(', ') || ''}`,
+    `Certifications: ${page.certifications.join(' | ') || ''}`,
+  ];
+  return lines.join('\n') + '\n' + rawProfileBlock(page);
+}
+function themText(page) {
+  return [page.name, page.headline, page.location, page.about, ...page.experience, ...page.education,
+    ...page.skills, ...page.certifications, page.pageText].filter(Boolean).join(' \n ');
+}
+
+function commonGroundPrompt(profile, page, goal, goalContext) {
+  const system = `You compare two LinkedIn profiles and find genuine common ground between them. You are strict: an overlap only counts if it is TRUE on both profiles. You never invent, stretch or exaggerate a similarity.
 
 ${HUMAN_WRITING_RULES}`;
-  const user = `RECIPIENT (from their LinkedIn page)
-Name: ${page.name || '(unknown)'}
-Headline: ${page.headline || ''}
-Location: ${page.location || ''}
-About: ${page.about || ''}
-Experience: ${page.experience.join(' | ') || ''}
-Skills: ${page.skills.join(', ') || ''}
+  const user = `ME (the person who will send the message)
+${meBlock(profile)}
+${goalContext ? `What I'm looking for: ${goalContext}\n` : ''}
+THEM (the LinkedIn profile I'm looking at)
+${themBlock(page)}
 
-SENDER
-Name: ${profile.name || '(not given)'}
-Current role: ${profile.jobs[0] ? [profile.jobs[0].title, profile.jobs[0].company].filter(Boolean).join(' at ') : '(not given)'}
-Skills: ${profile.skills || '(not given)'}
+TASK
+List every genuine overlap between ME and THEM, strongest first. Types:
+- "direct": same company, school, city or region, industry, job function, certification, or tool.
+- "transferable": different jobs that share a real skill or experience. Example: ME worked in a warehouse and THEM worked at a gym, so both know physical, on-your-feet work and heavy lifting. Or ME's customer service job and THEM's sales role both involve handling difficult customers.
+- "direction": something ME is working toward that THEM has already done (their role, their field, their path from X to Y).
+- "values": values or interests visible on both profiles (volunteering, causes, side projects).
 
-GOAL: ${goals[goal] || goals.networking}
+For each overlap give:
+- "type": one of the four types above;
+- "point": the overlap in plain words, the way one person would say it to another (for example "We've both done physical, on-your-feet work"). No buzzwords, never "synergy";
+- "me": a short phrase copied word for word from ME that proves it;
+- "them": a short phrase copied word for word from THEM that proves it.
+Skip anything that is only true for one side. If there is no genuine overlap, return an empty list.
+
+Return ONLY this JSON object, no markdown:
+{"overlaps":[{"type":"","point":"","me":"","them":""}]}`;
+  return { system, user };
+}
+
+// An evidence phrase counts when it appears in that side's own text, either
+// verbatim or with most of its meaningful words present.
+function normText(t) { return String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+function evidenceIn(evidence, source) {
+  const e = normText(evidence); const src = ' ' + normText(source) + ' ';
+  if (!e || e.length < 3) return false;
+  if (src.includes(' ' + e + ' ') || src.includes(e)) return true;
+  const words = e.split(' ').filter((w) => w.length > 2);
+  if (!words.length) return false;
+  const hit = words.filter((w) => src.includes(' ' + w + ' ') || src.includes(' ' + w.replace(/s$/, '') + ' ')).length;
+  return hit / words.length >= 0.6;
+}
+function pickCommonGround(raw, profile, page) {
+  const meSrc = meBlock(profile); const themSrc = themText(page);
+  const list = Array.isArray(raw && raw.overlaps) ? raw.overlaps : [];
+  for (const o of list) {
+    if (!o || !GROUND_TYPES.includes(o.type) || o.type === 'none') continue;
+    const point = clean(o.point);
+    if (!point || !evidenceIn(o.me, meSrc) || !evidenceIn(o.them, themSrc)) continue;
+    return { point, type: o.type, me: clean(o.me), them: clean(o.them) };
+  }
+  return { point: '', type: 'none' };
+}
+
+function outreachPrompt(profile, page, goal, goalContext, ground) {
+  const goals = {
+    networking: 'GOAL: networking. The common ground IS the reason to connect. Soft ask: connect, or a short chat.',
+    jobseeking: `GOAL: job seeking${goalContext ? ' (looking for a "' + goalContext + '" role)' : ''}. Common ground first, then a light question about their team or their path. Never ask for a job, a referral or a favour in the first message.`,
+    sales: `GOAL: sales${goalContext ? ' (selling "' + goalContext + '")' : ''}. Common ground first, then one relevant, specific reason the product helps someone in their role. No hard pitch, no pricing, no calendar links.`,
+    recruiting: `GOAL: recruiting${goalContext ? ' (for "' + goalContext + '")' : ''}. Common ground plus why their specific background fits the role.`,
+  };
+  const opener = ground && ground.type !== 'none'
+    ? `COMMON GROUND TO LEAD WITH (${ground.type}, true on both profiles): ${ground.point}
+  Proof on my profile: "${ground.me}". Proof on theirs: "${ground.them}".
+  Mention it in the first or second sentence of every message, plainly, like one person noticing something about another. Don't overstate it and don't add any other claimed similarity.`
+    : `COMMON GROUND: none was found that is true on both profiles. Do NOT claim any shared experience, background or interest. Instead lead with one specific, honest point of interest in THEIR work (from their page) tied to my goal.`;
+  const system = `You write LinkedIn messages that build real connections because they start from genuine common ground and sound like a person wrote them.
+
+${HUMAN_WRITING_RULES}`;
+  const user = `ME (the sender)
+${meBlock(profile) || '(no details saved)'}
+
+THEM (the recipient)
+${themBlock(page)}
+
+${opener}
+
+${goals[goal] || goals.networking}
+
+MESSAGE RULES
+- Use their first name. No flattery ("I'm impressed by your amazing journey" and the like).
+- Every claim about me must come from ME above; every detail about them from THEM above.
+- Never open with "I came across your profile" or "I hope this finds you well".
 
 WRITE
 - "summary": two sentences on who the recipient is and the best angle for reaching out.
-- "messages": three different messages. Each must reference at least one specific, real detail from the recipient's page. Never open with "I came across your profile" or "I hope this finds you well".
-  1. professional, under 90 words;
-  2. warm and conversational, under 90 words;
-  3. direct, under 280 characters so it fits a LinkedIn connection note.
+- "messages": three different messages, in this order:
+  1. first message, professional: under 90 words, at most one question;
+  2. first message, warm and conversational: under 90 words, at most one question;
+  3. connection request note: under 300 characters (LinkedIn's limit).
+- "hook": in plain words, the one thing about them the messages open with (used only when there is no common ground).
 
 Return ONLY this JSON object, no markdown:
-{"summary":"","messages":["","",""]}`;
+{"summary":"","messages":["","",""],"hook":""}`;
   return { system, user };
+}
+
+// LinkedIn rejects connection notes over 300 characters: cut at a sentence end.
+function fitNote(text, max = 300) {
+  const t = String(text || '').trim();
+  if (t.length <= max) return t;
+  let out = '';
+  for (const s of sentences(t)) { if ((out + s).trim().length > max) break; out += s; }
+  out = out.trim();
+  if (out.length >= max * 0.6) return out;
+  const cut = t.slice(0, max - 1); const atWord = cut.replace(/\s+\S*$/, '');
+  return (atWord.length >= max * 0.6 ? atWord : cut) + '…';
 }
 
 function optimizerPrompt(page) {
@@ -370,7 +500,7 @@ About: ${page.about || '(empty)'}
 Experience: ${page.experience.join(' | ') || '(none)'}
 Education: ${page.education.join(' | ') || '(none)'}
 Skills: ${page.skills.join(', ') || '(none)'}
-
+${rawProfileBlock(page)}
 WRITE
 - "headline": under 220 characters, specific and keyword-rich, no buzzwords.
 - "about": first person with contractions (I'm, I've, I'd), 180 to 300 words, in short paragraphs separated by a blank line, with a strong specific first line.
@@ -796,14 +926,33 @@ function createHandler(deps = {}) {
       await humanize(texts, 'optimizer', null);
       return { type: 'optimizer', data };
     }
-    const raw = await claudeJson(outreachPrompt(profile, page, body.goal, clean(body.goalContext).slice(0, 200)), settings);
+    // Outreach, stage 1: common ground between ME and THEM, checked against both
+    // profiles so nothing is invented. An empty ME profile skips it entirely.
+    const goalContext = clean(body.goalContext).slice(0, 200);
+    let ground = { point: '', type: 'none' };
+    if (meHasDetail(profile)) {
+      try {
+        const cg = await claudeJson(commonGroundPrompt(profile, page, body.goal, goalContext), { maxTokens: 900, temperature: 0.2 });
+        ground = pickCommonGround(cg, profile, page);
+      } catch (e) {
+        log.error('[outreach] common ground stage failed, writing without it', e && (e.publicMessage || e.message));
+      }
+    }
+    // Stage 2: the messages, opening with that common ground.
+    const raw = await claudeJson(outreachPrompt(profile, page, body.goal, goalContext, ground), settings);
     const out = {
       summary: clean(raw.summary),
       messages: (Array.isArray(raw.messages) ? raw.messages : []).map((m) => String(m || '').trim()).filter(Boolean).slice(0, 3),
+      commonGround: {
+        point: ground.type !== 'none' ? ground.point : (clean(raw.hook) ? `No shared background found. Opened with: ${clean(raw.hook)}` : 'No shared background found.'),
+        type: ground.type,
+      },
     };
     const texts = [{ text: out.summary, set: (v) => { out.summary = v; } }];
     out.messages.forEach((m, i) => texts.push({ text: m, set: (v) => { out.messages[i] = v; } }));
+    texts.push({ text: out.commonGround.point, set: (v) => { out.commonGround.point = v; } });
     await humanize(texts, 'outreach', null);
+    if (out.messages[2]) out.messages[2] = fitNote(out.messages[2]);
     return out;
   }
 
@@ -877,7 +1026,7 @@ function createHandler(deps = {}) {
     if ((mode === 'resume' || mode === 'coverletter' || mode === 'bundle') && !page.jobTitle && !page.jobDescription) {
       return reply(422, { error: 'no_job', message: 'Could not read the job posting. Open the job on LinkedIn and try again. You were not charged.' });
     }
-    if ((mode === 'outreach' || mode === 'optimizer') && !page.name && !page.headline) {
+    if ((mode === 'outreach' || mode === 'optimizer') && !page.name && !page.headline && !page.pageText) {
       return reply(422, { error: 'no_profile', message: 'Could not read this LinkedIn page. Open a profile and try again. You were not charged.' });
     }
 
@@ -946,4 +1095,4 @@ module.exports.MODE_LABELS = MODE_LABELS;
 module.exports.normalizeProfile = normalizeProfile;
 module.exports.finalizeResume = finalizeResume;
 module.exports.sanitizePage = sanitizePage;
-module.exports._internal = { fixDashes, humanizeCheck, bannedIn, HUMAN_WRITING_RULES, keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
+module.exports._internal = { commonGroundPrompt, pickCommonGround, evidenceIn, meBlock, meHasDetail, fitNote, rawProfileBlock, fixDashes, humanizeCheck, bannedIn, HUMAN_WRITING_RULES, keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
