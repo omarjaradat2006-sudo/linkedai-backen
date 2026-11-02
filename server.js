@@ -4,6 +4,7 @@ const fetch = require('node-fetch');
 const { JWT } = require('google-auth-library');
 
 const app = express();
+app.use(require('./feedback.cjs'));
 
 // ---- CONFIG ----
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
