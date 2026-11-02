@@ -238,14 +238,50 @@ async function sendFeedbackEmail(entry) {
       <p style="margin-top:18px;color:#888;font-size:12px">Hit Reply to answer them directly.</p>
     </div>`;
 
+  const subject = `[LinkedAI] ${entry.topic} — from ${entry.name}`;
+
+  // Render's free plan blocks SMTP, so when RESEND_API_KEY is set the email
+  // goes out over HTTPS through Resend instead of Gmail SMTP.
+  if (process.env.RESEND_API_KEY) {
+    return sendViaResend({ subject, text, html, replyTo: entry.email });
+  }
+
   await getTransporter().sendMail({
     from: { name: 'LinkedAI Feedback', address: process.env.GMAIL_USER },
     to: process.env.FEEDBACK_TO_EMAIL,
     replyTo: { name: entry.name, address: entry.email },
-    subject: `[LinkedAI] ${entry.topic} — from ${entry.name}`,
+    subject,
     text,
     html,
   });
+}
+
+async function sendViaResend({ subject, text, html, replyTo }) {
+  const to = process.env.FEEDBACK_TO_EMAIL;
+  if (!to) throw new Error('Email is not configured: FEEDBACK_TO_EMAIL is missing.');
+  // Without a verified domain Resend only sends from onboarding@resend.dev, and
+  // only to the email address the Resend account was created with.
+  const from = process.env.RESEND_FROM || 'LinkedAI Feedback <onboarding@resend.dev>';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from, to: [to], reply_to: replyTo, subject, text, html }),
+      signal: controller.signal,
+    });
+    if (!r.ok) {
+      const detail = (await r.text()).slice(0, 300);
+      throw new Error(`Resend returned ${r.status}: ${detail}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------- Route ----------
