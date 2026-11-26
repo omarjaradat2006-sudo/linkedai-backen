@@ -197,8 +197,23 @@ const HUMAN_BANNED = [
   'cutting-edge', 'furthermore', 'moreover', 'additionally', 'in conclusion',
   'I believe I would be a great fit', 'look no further', 'hit the ground running',
   'wear many hats', 'above and beyond', 'thank you for your time and consideration',
+  // Nov 2026 voiceprint update: words current detectors key on.
+  'showcase', 'underscore', 'pivotal', 'crucial', 'cultivate', 'realm', 'nuanced', 'multifaceted',
+  'holistic', 'intricate', 'meticulous', 'profound', 'vibrant', 'harness', 'streamline',
+  'transformative', 'groundbreaking', 'myriad', 'plethora', 'paramount', 'deep dive', 'facilitate',
+  'comprehensive', 'I would welcome the opportunity', 'excited to', 'I am eager',
 ];
 const HUMAN_WRITING_RULES = `HUMAN_WRITING_RULES
+
+START FROM THEIR OWN WORDS
+- The user's profile is the source. Reuse their own phrasing for duties, tools and results wherever it works; fix only spelling and grammar. Text built from a real person's words reads as human to detectors, text rewritten from scratch does not.
+- Keep their plain words and a slightly blunt sentence if it is theirs. Do not polish every line to the same smoothness. Uniformly perfect, even prose is itself an AI signal.
+
+DON'T WRITE LIKE AN ASSISTANT
+- Do not answer every requirement in the job posting with equal care. Pick the two or three that best match the user's real experience, give those the detail, and mention the rest briefly or not at all.
+- No sentences that only restate the posting, signpost ("In this role I..."), or balance with "on the other hand".
+- No "-ing" add-ons that only make a fact sound bigger (", ensuring smooth operations", ", showcasing strong leadership").
+- Make each point once, briefly, the way the user would say it.
 
 SPECIFIC, NOT GENERIC
 - Every claim must come from the user's real profile or the job posting. Never invent employers, numbers, tools, awards or education.
@@ -224,6 +239,8 @@ BANNED PATTERNS
 - No closing sentence that just repeats what the paragraph said.
 - No exclamation marks in resumes or cover letters. At most one in outreach.
 - No emojis unless the mode is outreach AND the goal is casual.
+- Never add deliberate typos, odd spacing, look-alike letters, zero-width or other unusual Unicode characters. Detectors flag them and they break ATS parsing.
+- No synonym swapping to sound different. Use the normal word.
 
 MODE-SPECIFIC
 - Resume headline: the job title ONLY. Certifications go in the certifications field, never in the headline.
@@ -630,6 +647,7 @@ const BANNED_RES = HUMAN_BANNED.map((w) => [w, phraseRegex(w)]);
 const BANNED_PATTERNS = [
   ['not only ... but also', /\bnot only\b[^.!?]*\bbut also\b/i],
   ["it's not just X, it's Y", /\bit['’]s not just\b/i],
+  ['-ing padding (", ensuring/showcasing...")', /,\s+(?:ensuring|showcasing|highlighting|underscoring|fostering|reflecting|demonstrating|contributing to)\b/i],
 ];
 function bannedIn(text) {
   const t = String(text || '');
@@ -640,8 +658,18 @@ function bannedIn(text) {
 }
 // Step 1 (dashes) always runs; the returned hits decide whether the single
 // rewrite pass runs.
+// Removes hidden and look-alike characters and makes quotes ATS-safe.
+// Never changes wording.
+function fixChars(text) {
+  return String(text == null ? '' : text)
+    .replace(/[\u200B-\u200D\u2060\uFEFF\u00AD]/g, '')
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F]/g, ' ')
+    .replace(/[\u2018\u2019\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201F]/g, '"')
+    .replace(/ {2,}/g, ' ');
+}
 function humanizeCheck(text) {
-  const fixed = fixDashes(text);
+  const fixed = fixDashes(fixChars(text));
   return { text: fixed, hits: bannedIn(fixed) };
 }
 const HUMANIZE_STATS = { runs: 0, rewrites: 0, phrases: {} };
@@ -856,7 +884,7 @@ function createHandler(deps = {}) {
         let v = typeof texts[i] === 'string' ? texts[i].trim() : '';
         if (!v || v.length < f.text.length * 0.4) return; // keep the original rather than lose content
         if (noBang) v = v.replace(/!+/g, '.');
-        v = fixDashes(v);
+        v = fixDashes(fixChars(v));
         if (allowed && unsupported(v, allowed) && !unsupported(f.text, allowed)) return; // no new numbers
         f.set(v);
       });
@@ -1095,4 +1123,4 @@ module.exports.MODE_LABELS = MODE_LABELS;
 module.exports.normalizeProfile = normalizeProfile;
 module.exports.finalizeResume = finalizeResume;
 module.exports.sanitizePage = sanitizePage;
-module.exports._internal = { commonGroundPrompt, pickCommonGround, evidenceIn, meBlock, meHasDetail, fitNote, rawProfileBlock, fixDashes, humanizeCheck, bannedIn, HUMAN_WRITING_RULES, keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
+module.exports._internal = { commonGroundPrompt, pickCommonGround, evidenceIn, meBlock, meHasDetail, fitNote, rawProfileBlock, fixDashes, fixChars, humanizeCheck, bannedIn, HUMAN_WRITING_RULES, keepTrueName, numbersIn, profileNumbers, cleanHeadline, cleanSummary, enc, dec, resumePrompt, letterPrompt, outreachPrompt, optimizerPrompt };
